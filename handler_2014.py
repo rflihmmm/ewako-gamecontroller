@@ -13,8 +13,8 @@ import argparse
 import sys
 from enum import Enum
 
-# Import from receiver.py (not receiver_2014.py)
-from receiver import GameStateReceiver
+# Import from receiver_2014.py
+from receiver_2014 import GameStateReceiver
 
 # Configure logging
 logger = logging.getLogger('game_state_handler')
@@ -48,17 +48,16 @@ class GameStateHandler(GameStateReceiver):
     for each state change received from the GameController.
     """
     
-    def __init__(self, team, player, is_goalkeeper=False, scripts_directory="."):
+    def __init__(self, team, player, scripts_directory="."):
         """
         Initialize the GameStateHandler.
         
         Args:
             team (int): Team number
             player (int): Player number
-            is_goalkeeper (bool): Whether this player is a goalkeeper
             scripts_directory (str): Directory containing state scripts
         """
-        super(GameStateHandler, self).__init__(team, player, is_goalkeeper)
+        super(GameStateHandler, self).__init__(team, player)
         self.scripts_directory = scripts_directory
         self.current_state = None
         self.current_process = None
@@ -68,8 +67,6 @@ class GameStateHandler(GameStateReceiver):
         
         # Initialize state display
         logger.info("GameStateHandler initialized for team %d, player %d", team, player)
-        if is_goalkeeper:
-            logger.info("Player is configured as goalkeeper")
         logger.info("Ready to handle game state changes...")
 
     def on_new_gamestate(self, state):
@@ -126,7 +123,6 @@ class GameStateHandler(GameStateReceiver):
                     logger.info(f"Launching script for state {state_value}: {script_path}")
                     
                     # Pass state information as command line arguments
-                    # Note: kick_of_team is the correct attribute name in gamestate.py
                     cmd = [
                         sys.executable,
                         script_path,
@@ -135,9 +131,7 @@ class GameStateHandler(GameStateReceiver):
                         "--state", str(state_value),
                         "--first-half", str(full_state.first_half),
                         "--kick-off-team", str(full_state.kick_of_team),
-                        "--secondary-state", str(full_state.secondary_state),
-                        "--seconds-remaining", str(full_state.seconds_remaining),
-                        "--secondary-seconds-remaining", str(full_state.secondary_seconds_remaining)
+                        "--secondary-state", str(full_state.secondary_state)
                     ]
                     
                     # Launch the process
@@ -169,14 +163,11 @@ class GameStateHandler(GameStateReceiver):
         Args:
             process: The subprocess to monitor
         """
-        try:
-            for line in process.stdout:
-                logger.info(f"Script output: {line.strip()}")
-            
-            for line in process.stderr:
-                logger.error(f"Script error: {line.strip()}")
-        except Exception as e:
-            logger.debug(f"Process monitoring stopped: {e}")
+        for line in process.stdout:
+            logger.info(f"Script output: {line.strip()}")
+        
+        for line in process.stderr:
+            logger.error(f"Script error: {line.strip()}")
     
     def terminate_current_process(self):
         """Safely terminates the currently running process, if any."""
@@ -225,11 +216,6 @@ class GameStateHandler(GameStateReceiver):
 def create_dummy_scripts():
     """Creates dummy script files for testing if they don't exist."""
     for state, script_name in SCRIPTS.items():
-        # Create directory if it doesn't exist
-        script_dir = os.path.dirname(script_name)
-        if script_dir and not os.path.exists(script_dir):
-            os.makedirs(script_dir)
-            
         if not os.path.exists(script_name):
             with open(script_name, 'w') as f:
                 f.write(f"""#!/usr/bin/env python
@@ -246,22 +232,18 @@ parser.add_argument('--state', type=int, required=True)
 parser.add_argument('--first-half', type=str, required=True)
 parser.add_argument('--kick-off-team', type=str, required=True)
 parser.add_argument('--secondary-state', type=str, required=True)
-parser.add_argument('--seconds-remaining', type=str, required=True)
-parser.add_argument('--secondary-seconds-remaining', type=str, required=True)
 
 args = parser.parse_args()
 
-print(f"Running state {{args.state}} script for team {{args.team}}, player {{args.player}}")
-print(f"First half: {{args.first_half}}, Kick-off team: {{args.kick_off_team}}")
-print(f"Secondary state: {{args.secondary_state}}")
-print(f"Seconds remaining: {{args.seconds_remaining}}, Secondary seconds: {{args.secondary_seconds_remaining}}")
+print(f"Running state {args.state} script for team {args.team}, player {args.player}")
+print(f"First half: {args.first_half}, Kick-off team: {args.kick_off_team}, Secondary state: {args.secondary_state}")
 
 # Simulate some work
 for i in range(10):
-    print(f"State {{args.state}} working... {{i+1}}/10")
+    print(f"State {args.state} working... {i+1}/10")
     time.sleep(1)
     
-print(f"State {{args.state}} script completed")
+print(f"State {args.state} script completed")
 """)
             print(f"Created dummy script: {script_name}")
             # Make the script executable on Unix/Linux
@@ -273,7 +255,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Game Controller State Handler")
     parser.add_argument('--team', type=int, default=1, help="Team number (default: 1)")
     parser.add_argument('--player', type=int, default=1, help="Player number (default: 1)")
-    parser.add_argument('--goalkeeper', action='store_true', help="Set this player as goalkeeper")
     parser.add_argument('--scripts-dir', type=str, default=".", help="Directory containing state scripts")
     parser.add_argument('--create-dummy-scripts', action='store_true', help="Create dummy scripts for testing")
     
@@ -284,14 +265,12 @@ if __name__ == "__main__":
         create_dummy_scripts()
     
     try:
-        handler = GameStateHandler(args.team, args.player, args.goalkeeper, args.scripts_dir)
+        handler = GameStateHandler(args.team, args.player, args.scripts_dir)
         
         # Run the receiver in the main thread
         handler.receive_forever()
     except KeyboardInterrupt:
         print("\nKeyboard interrupt received, shutting down...")
-    except Exception as e:
-        logger.error(f"Error in main: {e}")
     finally:
         if 'handler' in locals():
             handler.stop()
