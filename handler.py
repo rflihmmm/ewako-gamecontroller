@@ -1,297 +1,240 @@
-#!/usr/bin/env python
-# -*- coding:utf-8 -*-
-
-from __future__ import unicode_literals, print_function
-
-import os
-import time
-import signal
-import logging
+# state.py
 import threading
 import subprocess
-import argparse
-import sys
-from enum import Enum
+import time
+import socket
+from construct import ConstError
+from gamestate import GameState
+import logging
 
-# Import from receiver.py (not receiver_2014.py)
-from receiver import GameStateReceiver
-
-# Configure logging
-logger = logging.getLogger('game_state_handler')
+# Setup logging
+logger = logging.getLogger('state_monitor')
 logger.setLevel(logging.DEBUG)
-
 console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+console_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 logger.addHandler(console_handler)
 
-# Define game states as Enum for better clarity
-class GameStates(Enum):
-    STATE_INITIAL = 0
-    STATE_READY = 1
-    STATE_SET = 2
-    STATE_PLAYING = 3
-    STATE_FINISHED = 4
+# Game Controller configuration
+DEFAULT_LISTENING_HOST = '0.0.0.0'
+GAME_CONTROLLER_LISTEN_PORT = 3838
 
-# Scripts to run for each game state
-# You can customize these paths according to your needs
-SCRIPTS = {
-    GameStates.STATE_INITIAL.value: "./motion/initial_state.py",
-    GameStates.STATE_READY.value: "./motion/ready_state.py",
-    GameStates.STATE_SET.value: "./motion/set_state.py",
-    GameStates.STATE_PLAYING.value: "./motion/playing_state.py",
-    GameStates.STATE_FINISHED.value: "./motion/finished_state.py"
+# Global variables
+current_state = None
+lock = threading.Lock()
+
+# Mapping game states to Python files
+STATE_FILES = {
+    0: "initial_state.py",    # STATE_INITIAL
+    1: "ready_state.py",      # STATE_READY
+    2: "set_state.py",        # STATE_SET
+    3: "playing_state.py",    # STATE_PLAYING
+    4: "finished_state.py"    # STATE_FINISHED
 }
 
-class GameStateHandler(GameStateReceiver):
-    """
-    Handles different game states by running appropriate scripts
-    for each state change received from the GameController.
-    """
-    
-    def __init__(self, team, player, is_goalkeeper=False, scripts_directory="."):
-        """
-        Initialize the GameStateHandler.
-        
-        Args:
-            team (int): Team number
-            player (int): Player number
-            is_goalkeeper (bool): Whether this player is a goalkeeper
-            scripts_directory (str): Directory containing state scripts
-        """
-        super(GameStateHandler, self).__init__(team, player, is_goalkeeper)
-        self.scripts_directory = scripts_directory
-        self.current_state = None
-        self.current_process = None
-        self.process_lock = threading.Lock()
-        self.state_thread = None
-        self.running = True
-        
-        # Initialize state display
-        logger.info("GameStateHandler initialized for team %d, player %d", team, player)
-        if is_goalkeeper:
-            logger.info("Player is configured as goalkeeper")
-        logger.info("Ready to handle game state changes...")
+STATE_NAMES = {
+    0: "STATE_INITIAL",
+    1: "STATE_READY",
+    2: "STATE_SET",
+    3: "STATE_PLAYING",
+    4: "STATE_FINISHED"
+}
 
-    def on_new_gamestate(self, state):
-        """
-        Called when a new game state is received from the GameController.
-        
-        Args:
-            state: The game state received from GameController
-        """
-        state_value = state.game_state
-        state_name = GameStates(state_value).name if state_value in [s.value for s in GameStates] else "UNKNOWN"
-        
-        logger.info(f"Received game state: {state_value} - {state_name}")
-        
-        # Skip if state hasn't changed
-        if self.current_state == state_value:
-            logger.debug(f"State {state_name} unchanged, not restarting script")
-            return
-            
-        # Update state and launch appropriate script in a new thread
-        self.current_state = state_value
-        
-        # Launch in thread to avoid blocking receiver
-        if self.state_thread and self.state_thread.is_alive():
-            logger.debug("Waiting for previous state thread to complete...")
-            self.state_thread.join(1.0)  # Wait max 1 second
-            
-        self.state_thread = threading.Thread(
-            target=self.handle_state_change, 
-            args=(state_value, state)
-        )
-        self.state_thread.daemon = True
-        self.state_thread.start()
-        
-    def handle_state_change(self, state_value, full_state):
-        """
-        Handles state change by terminating any running script
-        and launching the appropriate one for the new state.
-        
-        Args:
-            state_value: The numeric game state value
-            full_state: The complete state object with all data
-        """
-        with self.process_lock:
-            # Terminate any running process
-            self.terminate_current_process()
-            
-            # Launch new process if we have a script for this state
-            if state_value in SCRIPTS:
-                script_path = os.path.join(self.scripts_directory, SCRIPTS[state_value])
-                
-                # Only try to run the script if it exists
-                if os.path.exists(script_path):
-                    logger.info(f"Launching script for state {state_value}: {script_path}")
-                    
-                    # Pass state information as command line arguments
-                    # Note: kick_of_team is the correct attribute name in gamestate.py
-                    cmd = [
-                        sys.executable,
-                        script_path,
-                        "--team", str(self.team),
-                        "--player", str(self.player),
-                        "--state", str(state_value),
-                        "--first-half", str(full_state.first_half),
-                        "--kick-off-team", str(full_state.kick_of_team),
-                        "--secondary-state", str(full_state.secondary_state),
-                        "--seconds-remaining", str(full_state.seconds_remaining),
-                        "--secondary-seconds-remaining", str(full_state.secondary_seconds_remaining)
-                    ]
-                    
-                    # Launch the process
-                    try:
-                        self.current_process = subprocess.Popen(
-                            cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            universal_newlines=True
-                        )
-                        logger.debug(f"Process started with PID: {self.current_process.pid}")
-                        
-                        # Optional: Monitor process output in separate thread
-                        threading.Thread(
-                            target=self.monitor_process_output,
-                            args=(self.current_process,),
-                            daemon=True
-                        ).start()
-                        
-                    except Exception as e:
-                        logger.error(f"Failed to start script {script_path}: {e}")
-                else:
-                    logger.warning(f"Script {script_path} for state {state_value} not found")
+
+class GameStateListener:
+    """Class to listen for game state updates from Game Controller"""
     
-    def monitor_process_output(self, process):
-        """
-        Monitors and logs output from a subprocess.
-        
-        Args:
-            process: The subprocess to monitor
-        """
-        try:
-            for line in process.stdout:
-                logger.info(f"Script output: {line.strip()}")
-            
-            for line in process.stderr:
-                logger.error(f"Script error: {line.strip()}")
-        except Exception as e:
-            logger.debug(f"Process monitoring stopped: {e}")
+    def __init__(self, addr=(DEFAULT_LISTENING_HOST, GAME_CONTROLLER_LISTEN_PORT)):
+        self.addr = addr
+        self.socket = None
+        self.running = True
+        self._open_socket()
     
-    def terminate_current_process(self):
-        """Safely terminates the currently running process, if any."""
-        if self.current_process:
+    def _open_socket(self):
+        """Create and configure the socket"""
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(self.addr)
+        self.socket.settimeout(0.5)
+    
+    def listen_forever(self):
+        """Listen for game state updates in a loop"""
+        global current_state
+        
+        while self.running:
             try:
-                logger.info(f"Terminating previous process (PID: {self.current_process.pid})")
+                data, peer = self.socket.recvfrom(GameState.sizeof())
                 
-                # On Windows, terminate() is the only option
-                if os.name == 'nt':
-                    self.current_process.terminate()
+                # Parse the game state
+                parsed_state = GameState.parse(data)
+                game_state_enum = parsed_state.game_state
+                
+                # Convert enum to integer value
+                if hasattr(game_state_enum, 'value'):
+                    game_state_value = game_state_enum.value
+                elif hasattr(game_state_enum, '_value'):
+                    game_state_value = game_state_enum._value
                 else:
-                    # On Linux/Unix we can try SIGTERM first, then SIGKILL
-                    os.kill(self.current_process.pid, signal.SIGTERM)
-                    
-                    # Give it a moment to terminate gracefully
-                    start_time = time.time()
-                    while time.time() - start_time < 1.0:
-                        if self.current_process.poll() is not None:
-                            break
-                        time.sleep(0.1)
-                    
-                    # If still running, force kill
-                    if self.current_process.poll() is None:
-                        logger.warning(f"Process didn't terminate, sending SIGKILL to PID: {self.current_process.pid}")
-                        os.kill(self.current_process.pid, signal.SIGKILL)
+                    # Fallback: try to convert to int directly
+                    try:
+                        game_state_value = int(game_state_enum)
+                    except (ValueError, TypeError):
+                        logger.warning(f"Could not convert game state to integer: {game_state_enum}")
+                        continue
                 
-                # Wait for process to finish to avoid zombies
-                self.current_process.wait(timeout=1.0)
-                logger.debug(f"Process terminated with return code: {self.current_process.returncode}")
+                # Update global state if it changed
+                with lock:
+                    if current_state != game_state_value:
+                        current_state = game_state_value
+                        state_name = STATE_NAMES.get(game_state_value, f"UNKNOWN({game_state_value})")
+                        logger.info(f"Game state changed to: {state_name} ({game_state_value})")
                 
-            except subprocess.TimeoutExpired:
-                logger.error("Process termination timed out")
+            except socket.timeout:
+                # Timeout is expected, continue listening
+                continue
+            except ConstError:
+                logger.warning("Parse Error: Probably using an old protocol!")
             except Exception as e:
-                logger.error(f"Error terminating process: {e}")
-            finally:
-                self.current_process = None
+                logger.error(f"Error receiving game state: {e}")
     
     def stop(self):
-        """Stop the handler and clean up resources."""
-        logger.info("Stopping GameStateHandler")
+        """Stop listening"""
         self.running = False
-        self.terminate_current_process()
-        super(GameStateHandler, self).stop()
+        if self.socket:
+            self.socket.close()
 
 
-def create_dummy_scripts():
-    """Creates dummy script files for testing if they don't exist."""
-    for state, script_name in SCRIPTS.items():
-        # Create directory if it doesn't exist
-        script_dir = os.path.dirname(script_name)
-        if script_dir and not os.path.exists(script_dir):
-            os.makedirs(script_dir)
-            
-        if not os.path.exists(script_name):
-            with open(script_name, 'w') as f:
-                f.write(f"""#!/usr/bin/env python
-# -*- coding:utf-8 -*-
-
-import sys
-import time
-import argparse
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--team', type=int, required=True)
-parser.add_argument('--player', type=int, required=True)
-parser.add_argument('--state', type=int, required=True)
-parser.add_argument('--first-half', type=str, required=True)
-parser.add_argument('--kick-off-team', type=str, required=True)
-parser.add_argument('--secondary-state', type=str, required=True)
-parser.add_argument('--seconds-remaining', type=str, required=True)
-parser.add_argument('--secondary-seconds-remaining', type=str, required=True)
-
-args = parser.parse_args()
-
-print(f"Running state {{args.state}} script for team {{args.team}}, player {{args.player}}")
-print(f"First half: {{args.first_half}}, Kick-off team: {{args.kick_off_team}}")
-print(f"Secondary state: {{args.secondary_state}}")
-print(f"Seconds remaining: {{args.seconds_remaining}}, Secondary seconds: {{args.secondary_seconds_remaining}}")
-
-# Simulate some work
-for i in range(10):
-    print(f"State {{args.state}} working... {{i+1}}/10")
-    time.sleep(1)
+def monitor_game_state():
+    """Monitor game state and manage subprocess execution"""
+    current_process = None
+    current_file = None
     
-print(f"State {{args.state}} script completed")
-""")
-            print(f"Created dummy script: {script_name}")
-            # Make the script executable on Unix/Linux
-            if os.name != 'nt':
-                os.chmod(script_name, 0o755)
+    while True:
+        with lock:
+            state = current_state
+        
+        # Check if we have a valid state and corresponding file
+        if state is not None and state in STATE_FILES:
+            target_file = STATE_FILES[state]
+            
+            # If we need to switch to a different file
+            if current_file != target_file:
+                # Terminate current process if running
+                if current_process and current_process.poll() is None:
+                    current_process.terminate()
+                    current_process.wait()  # Wait for process to actually terminate
+                    logger.info(f"[MONITOR] {current_file} terminated")
+                
+                # Start new process
+                try:
+                    current_process = subprocess.Popen(["python3", target_file])
+                    current_file = target_file
+                    state_name = STATE_NAMES.get(state, f"UNKNOWN({state})")
+                    logger.info(f"[MONITOR] {target_file} started for {state_name}")
+                except FileNotFoundError:
+                    logger.error(f"[MONITOR] File {target_file} not found!")
+                    current_file = None
+                except Exception as e:
+                    logger.error(f"[MONITOR] Error starting {target_file}: {e}")
+                    current_file = None
+        
+        else:
+            # No valid state or file, terminate any running process
+            if current_process and current_process.poll() is None:
+                current_process.terminate()
+                current_process.wait()
+                logger.info(f"[MONITOR] {current_file} terminated (invalid state)")
+                current_file = None
+        
+        time.sleep(0.1)
+
+
+def create_sample_state_files():
+    """Create sample state files for testing"""
+    sample_files = {
+        "initial_state.py": '''# initial_state.py
+import time
+
+counter = 0
+while True:
+    counter += 1
+    print(f"INITIAL STATE - Counter: {counter}")
+    time.sleep(1)
+''',
+        "ready_state.py": '''# ready_state.py
+import time
+
+counter = 0
+while True:
+    counter += 1
+    print(f"READY STATE - Counter: {counter}")
+    time.sleep(1)
+''',
+        "set_state.py": '''# set_state.py
+import time
+
+counter = 0
+while True:
+    counter += 1
+    print(f"SET STATE - Counter: {counter}")
+    time.sleep(1)
+''',
+        "playing_state.py": '''# playing_state.py
+import time
+
+counter = 0
+while True:
+    counter += 1
+    print(f"PLAYING STATE - Counter: {counter}")
+    time.sleep(0.5)
+''',
+        "finished_state.py": '''# finished_state.py
+import time
+
+counter = 0
+while True:
+    counter += 1
+    print(f"FINISHED STATE - Counter: {counter}")
+    time.sleep(2)
+'''
+    }
+    
+    import os
+    for filename, content in sample_files.items():
+        if not os.path.exists(filename):
+            with open(filename, 'w') as f:
+                f.write(content)
+            logger.info(f"Created sample file: {filename}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Game Controller State Handler")
-    parser.add_argument('--team', type=int, default=1, help="Team number (default: 1)")
-    parser.add_argument('--player', type=int, default=1, help="Player number (default: 1)")
-    parser.add_argument('--goalkeeper', action='store_true', help="Set this player as goalkeeper")
-    parser.add_argument('--scripts-dir', type=str, default=".", help="Directory containing state scripts")
-    parser.add_argument('--create-dummy-scripts', action='store_true', help="Create dummy scripts for testing")
+    # Create sample state files if they don't exist
+    create_sample_state_files()
     
-    args = parser.parse_args()
+    # Create game state listener
+    listener = GameStateListener()
     
-    # Create dummy scripts if requested
-    if args.create_dummy_scripts:
-        create_dummy_scripts()
+    # Create and start threads
+    listener_thread = threading.Thread(target=listener.listen_forever)
+    monitor_thread = threading.Thread(target=monitor_game_state)
+    
+    listener_thread.daemon = True
+    monitor_thread.daemon = True
+    
+    listener_thread.start()
+    monitor_thread.start()
+    
+    logger.info("State monitor started. Listening for game state changes...")
+    logger.info("Available states:")
+    for state_id, filename in STATE_FILES.items():
+        state_name = STATE_NAMES[state_id]
+        logger.info(f"  {state_name} ({state_id}) -> {filename}")
     
     try:
-        handler = GameStateHandler(args.team, args.player, args.goalkeeper, args.scripts_dir)
-        
-        # Run the receiver in the main thread
-        handler.receive_forever()
+        # Keep main thread alive
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt received, shutting down...")
-    except Exception as e:
-        logger.error(f"Error in main: {e}")
-    finally:
-        if 'handler' in locals():
-            handler.stop()
+        logger.info("Shutting down...")
+        listener.stop()
+        listener_thread.join(timeout=2)
+        monitor_thread.join(timeout=2)
