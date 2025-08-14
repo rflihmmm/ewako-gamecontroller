@@ -1,4 +1,4 @@
-# state.py
+# handler_with_latency.py
 import threading
 import subprocess
 import time
@@ -6,12 +6,14 @@ import socket
 from construct import ConstError
 from gamestate import GameState
 import logging
+from collections import deque
+import statistics
 
 # Setup logging
 logger = logging.getLogger('state_monitor')
 logger.setLevel(logging.DEBUG)
 console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logger.addHandler(console_handler)
 
 # Game Controller configuration
@@ -21,6 +23,9 @@ GAME_CONTROLLER_LISTEN_PORT = 3838
 # Global variables
 current_state = None
 lock = threading.Lock()
+
+# Latency tracking
+state_change_times = {}  # Track when state changes were received
 
 # Mapping game states to Python files
 STATE_FILES = {
@@ -38,6 +43,50 @@ STATE_NAMES = {
     3: "STATE_PLAYING",
     4: "STATE_FINISHED"
 }
+
+
+class LatencyTracker:
+    """Class to track and analyze latency metrics"""
+    
+    def __init__(self):
+        self.measurements = deque(maxlen=1000)
+        self.lock = threading.Lock()
+    
+    def add_measurement(self, latency_ms):
+        """Add a latency measurement in milliseconds"""
+        with self.lock:
+            self.measurements.append(latency_ms)
+    
+    def get_statistics(self):
+        """Get latency statistics"""
+        with self.lock:
+            if not self.measurements:
+                return None
+            
+            measurements = list(self.measurements)
+            return {
+                'count': len(measurements),
+                'latest': measurements[-1],
+                'average': statistics.mean(measurements),
+                'median': statistics.median(measurements),
+                'min': min(measurements),
+                'max': max(measurements),
+                'std_dev': statistics.stdev(measurements) if len(measurements) > 1 else 0
+            }
+    
+    def print_statistics(self):
+        """Print current latency statistics"""
+        stats = self.get_statistics()
+        if stats:
+            logger.info("=== LATENCY STATISTICS ===")
+            logger.info(f"Total measurements: {stats['count']}")
+            logger.info(f"Latest: {stats['latest']:.2f} ms")
+            logger.info(f"Average: {stats['average']:.2f} ms")
+            logger.info(f"Median: {stats['median']:.2f} ms")
+            logger.info(f"Min: {stats['min']:.2f} ms")
+            logger.info(f"Max: {stats['max']:.2f} ms")
+            logger.info(f"Std Dev: {stats['std_dev']:.2f} ms")
+            logger.info("========================")
 
 
 class GameStateListener:
@@ -58,10 +107,12 @@ class GameStateListener:
     
     def listen_forever(self):
         """Listen for game state updates in a loop"""
-        global current_state
+        global current_state, state_change_times
         
         while self.running:
             try:
+                # Record precise timestamp when data is received
+                receive_time = time.time()
                 data, peer = self.socket.recvfrom(GameState.sizeof())
                 
                 # Parse the game state
@@ -85,8 +136,9 @@ class GameStateListener:
                 with lock:
                     if current_state != game_state_value:
                         current_state = game_state_value
+                        state_change_times[game_state_value] = receive_time
                         state_name = STATE_NAMES.get(game_state_value, f"UNKNOWN({game_state_value})")
-                        logger.info(f"Game state changed to: {state_name} ({game_state_value})")
+                        logger.info(f"Game state changed to: {state_name} ({game_state_value}) at {receive_time:.6f}")
                 
             except socket.timeout:
                 # Timeout is expected, continue listening
@@ -104,13 +156,14 @@ class GameStateListener:
 
 
 def monitor_game_state():
-    """Monitor game state and manage subprocess execution"""
+    """Monitor game state and manage subprocess execution with latency tracking"""
     current_process = None
     current_file = None
     
     while True:
         with lock:
             state = current_state
+            receive_time = state_change_times.get(state) if state is not None else None
         
         # Check if we have a valid state and corresponding file
         if state is not None and state in STATE_FILES:
@@ -118,6 +171,9 @@ def monitor_game_state():
             
             # If we need to switch to a different file
             if current_file != target_file:
+                # Record when we start processing the state change
+                process_start_time = time.time()
+                
                 # Terminate current process if running
                 if current_process and current_process.poll() is None:
                     current_process.terminate()
@@ -127,9 +183,26 @@ def monitor_game_state():
                 # Start new process
                 try:
                     current_process = subprocess.Popen(["python3", target_file])
+                    process_execution_time = time.time()
                     current_file = target_file
                     state_name = STATE_NAMES.get(state, f"UNKNOWN({state})")
-                    logger.info(f"[MONITOR] {target_file} started for {state_name}")
+                    
+                    # Calculate and display latency only once when executing
+                    if receive_time:
+                        # Total latency from receive to execution
+                        total_latency_ms = (process_execution_time - receive_time) * 1000
+                        # Processing latency (from start of processing to execution)
+                        processing_latency_ms = (process_execution_time - process_start_time) * 1000
+                        
+                        logger.info(f"[MONITOR] {target_file} started for {state_name} - Latency: {total_latency_ms:.2f}ms (Processing: {processing_latency_ms:.2f}ms)")
+                        
+                        # Clear the receive time for this state
+                        with lock:
+                            if state in state_change_times:
+                                del state_change_times[state]
+                    else:
+                        logger.info(f"[MONITOR] {target_file} started for {state_name}")
+                        
                 except FileNotFoundError:
                     logger.error(f"[MONITOR] File {target_file} not found!")
                     current_file = None
@@ -149,51 +222,61 @@ def monitor_game_state():
 
 
 def create_sample_state_files():
-    """Create sample state files for testing"""
+    """Create sample state files for testing with latency measurement"""
     sample_files = {
         "initial_state.py": '''# initial_state.py
 import time
+import os
 
+print(f"[{os.getpid()}] INITIAL STATE started at {time.time():.6f}")
 counter = 0
 while True:
     counter += 1
-    print(f"INITIAL STATE - Counter: {counter}")
+    print(f"[{os.getpid()}] INITIAL STATE - Counter: {counter}")
     time.sleep(1)
 ''',
         "ready_state.py": '''# ready_state.py
 import time
+import os
 
+print(f"[{os.getpid()}] READY STATE started at {time.time():.6f}")
 counter = 0
 while True:
     counter += 1
-    print(f"READY STATE - Counter: {counter}")
+    print(f"[{os.getpid()}] READY STATE - Counter: {counter}")
     time.sleep(1)
 ''',
         "set_state.py": '''# set_state.py
 import time
+import os
 
+print(f"[{os.getpid()}] SET STATE started at {time.time():.6f}")
 counter = 0
 while True:
     counter += 1
-    print(f"SET STATE - Counter: {counter}")
+    print(f"[{os.getpid()}] SET STATE - Counter: {counter}")
     time.sleep(1)
 ''',
         "playing_state.py": '''# playing_state.py
 import time
+import os
 
+print(f"[{os.getpid()}] PLAYING STATE started at {time.time():.6f}")
 counter = 0
 while True:
     counter += 1
-    print(f"PLAYING STATE - Counter: {counter}")
+    print(f"[{os.getpid()}] PLAYING STATE - Counter: {counter}")
     time.sleep(0.5)
 ''',
         "finished_state.py": '''# finished_state.py
 import time
+import os
 
+print(f"[{os.getpid()}] FINISHED STATE started at {time.time():.6f}")
 counter = 0
 while True:
     counter += 1
-    print(f"FINISHED STATE - Counter: {counter}")
+    print(f"[{os.getpid()}] FINISHED STATE - Counter: {counter}")
     time.sleep(2)
 '''
     }
@@ -223,7 +306,8 @@ if __name__ == "__main__":
     listener_thread.start()
     monitor_thread.start()
     
-    logger.info("State monitor started. Listening for game state changes...")
+    logger.info("State monitor with latency tracking started.")
+    logger.info("Listening for game state changes...")
     logger.info("Available states:")
     for state_id, filename in STATE_FILES.items():
         state_name = STATE_NAMES[state_id]
